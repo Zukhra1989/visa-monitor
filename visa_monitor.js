@@ -7,12 +7,16 @@ const CONFIG = {
   scheduleId: null,
   facilityId: 90,
   country: 'en-uz',
-  checkInterval: 5 * 60 * 1000,
   telegramToken: process.env.TELEGRAM_TOKEN || '8763727275:AAH5oDZ_NxhJL7YgDxQwm0aCJUXp-E9sJpw',
-  telegramChatId: process.env.TELEGRAM_CHAT_ID || '515561284'
+  telegramChatId: process.env.TELEGRAM_CHAT_ID || '515561284',
+  targetMonth: '2026-05', // ищем только май 2026
+  currentDate: '2026-08-26' // текущая запись
 };
 
 const BASE_URL = 'https://ais.usvisa-info.com';
+let cookies = '';
+let csrfToken = '';
+let foundDates = [];
 
 const client = axios.create({
   baseURL: BASE_URL,
@@ -26,9 +30,6 @@ const client = axios.create({
   httpsAgent: new https.Agent({ rejectUnauthorized: false })
 });
 
-let cookies = '';
-let csrfToken = '';
-
 async function sendTelegram(message) {
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.telegramToken}/sendMessage`, {
@@ -36,7 +37,6 @@ async function sendTelegram(message) {
       text: message,
       parse_mode: 'HTML'
     });
-    console.log('[TG] Sent!');
   } catch (e) {
     console.log('[TG] Error:', e.message);
   }
@@ -52,9 +52,7 @@ async function getCsrfToken() {
       if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
       return true;
     }
-  } catch (e) {
-    console.log('[ERR] CSRF:', e.message);
-  }
+  } catch (e) {}
   return false;
 }
 
@@ -79,15 +77,13 @@ async function login() {
 
     const setCookie = res.headers['set-cookie'];
     if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
-
-    if (res.status === 200 || res.status === 302) return true;
+    return res.status === 200 || res.status === 302;
   } catch (e) {
     if (e.response && (e.response.status === 200 || e.response.status === 302)) {
       const setCookie = e.response.headers['set-cookie'];
       if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
       return true;
     }
-    console.log('[ERR] Login:', e.message);
   }
   return false;
 }
@@ -128,8 +124,87 @@ async function checkDates() {
   }
 }
 
+async function getTimeSlots(date) {
+  try {
+    const res = await client.get(
+      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment/times/${CONFIG.facilityId}.json?date=${date}&appointments[expedite]=false`,
+      {
+        headers: {
+          'Cookie': cookies,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`
+        }
+      }
+    );
+    if (res.data && res.data.available_times && res.data.available_times.length > 0) {
+      return res.data.available_times;
+    }
+    return [];
+  } catch (e) {
+    console.log('[ERR] Times:', e.message);
+    return [];
+  }
+}
+
+async function bookAppointment(date, time) {
+  try {
+    // Get fresh CSRF token
+    const pageRes = await client.get(
+      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`,
+      { headers: { 'Cookie': cookies } }
+    );
+    const csrfMatch = pageRes.data.match(/csrf-token"\s+content="([^"]+)"/);
+    if (csrfMatch) csrfToken = csrfMatch[1];
+
+    const params = new URLSearchParams();
+    params.append('authenticity_token', csrfToken);
+    params.append('confirmed_limit_message', '1');
+    params.append('use_consulate_appointment_capacity', 'true');
+    params.append('appointments[consulate_appointment][facility_id]', CONFIG.facilityId);
+    params.append('appointments[consulate_appointment][date]', date);
+    params.append('appointments[consulate_appointment][time]', time);
+
+    const res = await client.post(
+      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`,
+      params.toString(),
+      {
+        headers: {
+          'Cookie': cookies,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-CSRF-Token': csrfToken,
+          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`
+        },
+        maxRedirects: 5
+      }
+    );
+
+    if (res.status === 200 || res.status === 302) return true;
+    return false;
+  } catch (e) {
+    console.log('[ERR] Booking:', e.message);
+    return false;
+  }
+}
+
+async function checkTelegramCommands() {
+  try {
+    const res = await axios.get(
+      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=5&timeout=1`
+    );
+    const updates = res.data.result || [];
+    for (const update of updates) {
+      const text = update.message?.text?.toUpperCase().trim();
+      const chatId = update.message?.chat?.id?.toString();
+      if (chatId === CONFIG.telegramChatId && text === 'BOOK' && foundDates.length > 0) {
+        return 'BOOK';
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
 async function run() {
-  console.log(`[${new Date().toISOString()}] Checking...`);
+  console.log(`[${new Date().toISOString()}] Checking for May 2026 dates...`);
 
   await getCsrfToken();
   const loggedIn = await login();
@@ -139,14 +214,53 @@ async function run() {
   if (!CONFIG.scheduleId) { console.log('[ERR] No schedule ID'); return; }
 
   const dates = await checkDates();
+  if (!dates) return;
 
-  if (dates && dates.length > 0) {
-    const list = dates.slice(0, 10).map(d => `• ${d.date}`).join('\n');
-    const msg = `🗓 <b>Появились свободные даты!</b>\n\nДоступные даты:\n${list}\n\nСрочно заходи:\nhttps://ais.usvisa-info.com/en-uz/niv`;
+  // Фильтруем только май 2026
+  const mayDates = dates.filter(d => d.date && d.date.startsWith(CONFIG.targetMonth));
+
+  if (mayDates.length > 0) {
+    foundDates = mayDates.map(d => d.date);
+    const list = foundDates.map(d => `• ${d}`).join('\n');
+
+    const msg = `🗓 <b>Найдены даты в мае 2026!</b>\n\nДоступные даты:\n${list}\n\n` +
+      `Твоя текущая дата: ${CONFIG.currentDate}\n\n` +
+      `Чтобы <b>автоматически забронировать</b> первую доступную дату,\n` +
+      `напиши боту: <b>BOOK</b>`;
+
     await sendTelegram(msg);
-    console.log('[FOUND] Dates available!', dates.slice(0, 3).map(d => d.date));
+    console.log('[FOUND] May dates:', foundDates);
+
+    // Проверяем команду BOOK
+    const command = await checkTelegramCommands();
+    if (command === 'BOOK') {
+      const targetDate = foundDates[0];
+      console.log('[BOOKING] Бронирую:', targetDate);
+      await sendTelegram(`⏳ Бронирую дату ${targetDate}...`);
+
+      const times = await getTimeSlots(targetDate);
+      if (times.length === 0) {
+        await sendTelegram('❌ Нет доступного времени для этой даты. Попробую завтра.');
+        return;
+      }
+
+      const selectedTime = times[0];
+      const booked = await bookAppointment(targetDate, selectedTime);
+
+      if (booked) {
+        await sendTelegram(
+          `✅ <b>Запись успешно перенесена!</b>\n\n` +
+          `📅 Новая дата: ${targetDate}\n` +
+          `🕐 Время: ${selectedTime}\n\n` +
+          `Проверь подтверждение на сайте:\nhttps://ais.usvisa-info.com/en-uz/niv`
+        );
+        console.log('[SUCCESS] Booked:', targetDate, selectedTime);
+      } else {
+        await sendTelegram('❌ Ошибка бронирования. Зайди на сайт вручную!');
+      }
+    }
   } else {
-    console.log('[INFO] No dates available');
+    console.log('[INFO] No May 2026 dates available');
   }
 }
 
