@@ -197,18 +197,45 @@ async function bookBothAppointments(date, time) {
   return results;
 }
 
+async function getCurrentAppointment() {
+  const scheduleId = CONFIG.scheduleIds[0];
+  try {
+    const res = await client.get(
+      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
+      { headers: { 'Cookie': cookies } }
+    );
+    const html = res.data;
+
+    // Ищем дату записи на странице
+    const dateMatch = html.match(/Consulate\s+Appointment[\s\S]*?(\d{1,2}\s+\w+,?\s+\d{4})/i)
+      || html.match(/Date:\s*<[^>]*>([^<]+)/i)
+      || html.match(/(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}/);
+
+    const timeMatch = html.match(/Time:\s*<[^>]*>([^<]+)/i)
+      || html.match(/(\d{2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)/i);
+
+    return {
+      date: dateMatch ? dateMatch[1].trim() : null,
+      time: timeMatch ? timeMatch[1].trim() : null
+    };
+  } catch (e) {
+    console.log('[ERR] getCurrentAppointment:', e.message);
+    return null;
+  }
+}
+
 async function checkTelegramCommands() {
   try {
     const res = await axios.get(
-      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=5&timeout=1`
+      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=10&timeout=1`
     );
     const updates = res.data.result || [];
     for (const update of updates) {
       const text = update.message?.text?.toUpperCase().trim();
       const chatId = update.message?.chat?.id?.toString();
-      if (chatId === CONFIG.telegramChatId && text === 'BOOK' && foundDates.length > 0) {
-        return 'BOOK';
-      }
+      if (chatId !== CONFIG.telegramChatId) continue;
+      if (text === 'BOOK' && foundDates.length > 0) return 'BOOK';
+      if (text === 'STATUS') return 'STATUS';
     }
   } catch (e) {}
   return null;
@@ -242,8 +269,22 @@ async function run() {
     await sendTelegram(msg);
     console.log('[FOUND] Earlier dates:', foundDates);
 
-    // Проверяем команду BOOK
+    // Проверяем команды
     const command = await checkTelegramCommands();
+
+    if (command === 'STATUS') {
+      const appt = await getCurrentAppointment();
+      await sendTelegram(
+        `📋 <b>Текущая запись в посольство США</b>\n\n` +
+        `📅 Дата: <b>${appt?.date || CONFIG.currentDate}</b>\n` +
+        `🕐 Время: <b>${appt?.time || 'уточни на сайте'}</b>\n` +
+        `👫 Заявители: муж и жена\n` +
+        `🏢 Посольство: Ташкент\n\n` +
+        `🔍 Бот ищет даты раньше ${CONFIG.currentDate}`
+      );
+      return;
+    }
+
     if (command === 'BOOK') {
       const targetDate = foundDates[0];
       console.log('[BOOKING] Бронирую:', targetDate);
