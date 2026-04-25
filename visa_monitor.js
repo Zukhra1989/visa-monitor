@@ -233,6 +233,7 @@ async function checkTelegramCommands() {
       if (chatId !== CONFIG.telegramChatId) continue;
       if (text === 'BOOK' && foundDates.length > 0) return 'BOOK';
       if (text === 'STATUS') return 'STATUS';
+      if (text === 'DATES') return 'DATES';
     }
   } catch (e) {}
   return null;
@@ -261,6 +262,25 @@ async function run() {
       `🏢 Посольство: Ташкент\n\n` +
       `🔍 Бот ищет даты раньше ${CONFIG.currentDate}`
     );
+    return;
+  }
+
+  if (command === 'DATES') {
+    const dates = await checkDates();
+    if (!dates || dates.length === 0) {
+      await sendTelegram(`📅 <b>Доступные даты на сайте</b>\n\n❌ Сейчас нет свободных дат`);
+    } else {
+      const list = dates.slice(0, 20).map(d => {
+        const isEarlier = d.date < CONFIG.currentDate;
+        return `${isEarlier ? '✅' : '📌'} ${d.date}`;
+      }).join('\n');
+      const total = dates.length;
+      await sendTelegram(
+        `📅 <b>Все доступные даты на сайте (${total} шт.):</b>\n\n${list}` +
+        (total > 20 ? `\n\n...и ещё ${total - 20} дат` : '') +
+        `\n\n✅ — раньше твоей записи (${CONFIG.currentDate})\n📌 — позже твоей записи`
+      );
+    }
     return;
   }
 
