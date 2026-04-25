@@ -4,7 +4,7 @@ const https = require('https');
 const CONFIG = {
   email: process.env.VISA_EMAIL || 'jxusenov@list.ru',
   password: process.env.VISA_PASSWORD || '212Aziko@Zuxa1989@',
-  scheduleId: null,
+  scheduleIds: [], // оба ID (муж и жена)
   facilityId: 90,
   country: 'en-uz',
   telegramToken: process.env.TELEGRAM_TOKEN || '8763727275:AAH5oDZ_NxhJL7YgDxQwm0aCJUXp-E9sJpw',
@@ -87,15 +87,16 @@ async function login() {
   return false;
 }
 
-async function getScheduleId() {
+async function getScheduleIds() {
   const endpoints = [`/${CONFIG.country}/niv/account`, `/${CONFIG.country}/niv/dashboard`, `/${CONFIG.country}/niv`];
   for (const ep of endpoints) {
     try {
       const res = await client.get(ep, { headers: { 'Cookie': cookies } });
-      const match = res.data.match(/\/schedule\/(\d+)\//);
-      if (match) {
-        CONFIG.scheduleId = match[1];
-        console.log('[OK] Schedule ID:', CONFIG.scheduleId);
+      const matches = [...res.data.matchAll(/\/schedule\/(\d+)\//g)];
+      const ids = [...new Set(matches.map(m => m[1]))];
+      if (ids.length > 0) {
+        CONFIG.scheduleIds = ids;
+        console.log('[OK] Schedule IDs найдены:', ids);
         return true;
       }
     } catch (e) {}
@@ -104,14 +105,15 @@ async function getScheduleId() {
 }
 
 async function checkDates() {
+  const scheduleId = CONFIG.scheduleIds[0];
   try {
     const res = await client.get(
-      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment/days/${CONFIG.facilityId}.json?appointments[expedite]=false`,
+      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment/days/${CONFIG.facilityId}.json?appointments[expedite]=false`,
       {
         headers: {
           'Cookie': cookies,
           'X-Requested-With': 'XMLHttpRequest',
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`
+          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
         }
       }
     );
@@ -124,14 +126,15 @@ async function checkDates() {
 }
 
 async function getTimeSlots(date) {
+  const scheduleId = CONFIG.scheduleIds[0];
   try {
     const res = await client.get(
-      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment/times/${CONFIG.facilityId}.json?date=${date}&appointments[expedite]=false`,
+      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment/times/${CONFIG.facilityId}.json?date=${date}&appointments[expedite]=false`,
       {
         headers: {
           'Cookie': cookies,
           'X-Requested-With': 'XMLHttpRequest',
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`
+          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
         }
       }
     );
@@ -145,11 +148,10 @@ async function getTimeSlots(date) {
   }
 }
 
-async function bookAppointment(date, time) {
+async function bookOneAppointment(scheduleId, date, time) {
   try {
-    // Get fresh CSRF token
     const pageRes = await client.get(
-      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`,
+      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
       { headers: { 'Cookie': cookies } }
     );
     const csrfMatch = pageRes.data.match(/csrf-token"\s+content="([^"]+)"/);
@@ -164,25 +166,35 @@ async function bookAppointment(date, time) {
     params.append('appointments[consulate_appointment][time]', time);
 
     const res = await client.post(
-      `/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`,
+      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
       params.toString(),
       {
         headers: {
           'Cookie': cookies,
           'Content-Type': 'application/x-www-form-urlencoded',
           'X-CSRF-Token': csrfToken,
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${CONFIG.scheduleId}/appointment`
+          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
         },
         maxRedirects: 5
       }
     );
 
-    if (res.status === 200 || res.status === 302) return true;
-    return false;
+    return res.status === 200 || res.status === 302;
   } catch (e) {
-    console.log('[ERR] Booking:', e.message);
+    console.log(`[ERR] Booking ${scheduleId}:`, e.message);
     return false;
   }
+}
+
+async function bookBothAppointments(date, time) {
+  const results = [];
+  for (const scheduleId of CONFIG.scheduleIds) {
+    console.log(`[BOOKING] Бронирую для ID ${scheduleId}: ${date} ${time}`);
+    const ok = await bookOneAppointment(scheduleId, date, time);
+    results.push({ scheduleId, ok });
+    await new Promise(r => setTimeout(r, 2000)); // пауза между запросами
+  }
+  return results;
 }
 
 async function checkTelegramCommands() {
@@ -209,8 +221,8 @@ async function run() {
   const loggedIn = await login();
   if (!loggedIn) { console.log('[ERR] Login failed'); return; }
 
-  if (!CONFIG.scheduleId) await getScheduleId();
-  if (!CONFIG.scheduleId) { console.log('[ERR] No schedule ID'); return; }
+  if (CONFIG.scheduleIds.length === 0) await getScheduleIds();
+  if (CONFIG.scheduleIds.length === 0) { console.log('[ERR] No schedule IDs found'); return; }
 
   const dates = await checkDates();
   if (!dates) return;
@@ -244,16 +256,27 @@ async function run() {
       }
 
       const selectedTime = times[0];
-      const booked = await bookAppointment(targetDate, selectedTime);
+      const results = await bookBothAppointments(targetDate, selectedTime);
 
-      if (booked) {
+      const allOk = results.every(r => r.ok);
+      const successCount = results.filter(r => r.ok).length;
+
+      if (allOk) {
         await sendTelegram(
-          `✅ <b>Запись успешно перенесена!</b>\n\n` +
+          `✅ <b>Запись успешно перенесена для обоих!</b>\n\n` +
           `📅 Новая дата: ${targetDate}\n` +
-          `🕐 Время: ${selectedTime}\n\n` +
+          `🕐 Время: ${selectedTime}\n` +
+          `👫 Записаны: муж и жена\n\n` +
           `Проверь подтверждение на сайте:\nhttps://ais.usvisa-info.com/en-uz/niv`
         );
-        console.log('[SUCCESS] Booked:', targetDate, selectedTime);
+        console.log('[SUCCESS] Both booked:', targetDate, selectedTime);
+      } else if (successCount > 0) {
+        await sendTelegram(
+          `⚠️ <b>Частичная запись!</b>\n\n` +
+          `📅 Дата: ${targetDate} | 🕐 Время: ${selectedTime}\n` +
+          `Записано ${successCount} из ${results.length}.\n\n` +
+          `❗ Зайди на сайт и проверь вручную!`
+        );
       } else {
         await sendTelegram('❌ Ошибка бронирования. Зайди на сайт вручную!');
       }
