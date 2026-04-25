@@ -201,23 +201,20 @@ async function getCurrentAppointment() {
   const scheduleId = CONFIG.scheduleIds[0];
   try {
     const res = await client.get(
-      `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
+      `/${CONFIG.country}/niv/schedule/${scheduleId}`,
       { headers: { 'Cookie': cookies } }
     );
     const html = res.data;
 
-    // Ищем дату записи на странице
-    const dateMatch = html.match(/Consulate\s+Appointment[\s\S]*?(\d{1,2}\s+\w+,?\s+\d{4})/i)
-      || html.match(/Date:\s*<[^>]*>([^<]+)/i)
-      || html.match(/(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}/);
+    // Формат на сайте: "26 August, 2026, 09:00 Tashkent local time"
+    const m = html.match(/(\d{1,2}\s+\w+,\s+\d{4}),\s+(\d{2}:\d{2})/);
+    if (m) {
+      console.log('[OK] Appointment:', m[1], m[2]);
+      return { date: m[1].trim(), time: m[2].trim() };
+    }
 
-    const timeMatch = html.match(/Time:\s*<[^>]*>([^<]+)/i)
-      || html.match(/(\d{2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)/i);
-
-    return {
-      date: dateMatch ? dateMatch[1].trim() : null,
-      time: timeMatch ? timeMatch[1].trim() : null
-    };
+    console.log('[INFO] Date not found on page');
+    return null;
   } catch (e) {
     console.log('[ERR] getCurrentAppointment:', e.message);
     return null;
