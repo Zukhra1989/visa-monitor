@@ -224,16 +224,23 @@ async function getCurrentAppointment() {
 async function checkTelegramCommands() {
   try {
     const res = await axios.get(
-      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=10&timeout=1`
+      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=20&timeout=1`
     );
     const updates = res.data.result || [];
-    for (const update of updates) {
+    const now = Math.floor(Date.now() / 1000);
+
+    // Берём только сообщения за последние 10 минут, самое новое последним
+    const recent = updates
+      .filter(u => u.message && (now - u.message.date) < 600)
+      .reverse();
+
+    for (const update of recent) {
       const text = update.message?.text?.toUpperCase().trim();
       const chatId = update.message?.chat?.id?.toString();
       if (chatId !== CONFIG.telegramChatId) continue;
-      if (text === 'BOOK' && foundDates.length > 0) return 'BOOK';
-      if (text === 'STATUS') return 'STATUS';
       if (text === 'DATES') return 'DATES';
+      if (text === 'STATUS') return 'STATUS';
+      if (text === 'BOOK' && foundDates.length > 0) return 'BOOK';
     }
   } catch (e) {}
   return null;
