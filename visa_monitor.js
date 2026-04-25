@@ -251,6 +251,22 @@ async function run() {
   if (CONFIG.scheduleIds.length === 0) await getScheduleIds();
   if (CONFIG.scheduleIds.length === 0) { console.log('[ERR] No schedule IDs found'); return; }
 
+  // Проверяем команды Telegram в первую очередь
+  const command = await checkTelegramCommands();
+
+  if (command === 'STATUS') {
+    const appt = await getCurrentAppointment();
+    await sendTelegram(
+      `📋 <b>Текущая запись в посольство США</b>\n\n` +
+      `📅 Дата: <b>${appt?.date || CONFIG.currentDate}</b>\n` +
+      `🕐 Время: <b>${appt?.time || 'уточни на сайте'}</b>\n` +
+      `👫 Заявители: муж и жена\n` +
+      `🏢 Посольство: Ташкент\n\n` +
+      `🔍 Бот ищет даты раньше ${CONFIG.currentDate}`
+    );
+    return;
+  }
+
   const dates = await checkDates();
   if (!dates) return;
 
@@ -268,22 +284,6 @@ async function run() {
 
     await sendTelegram(msg);
     console.log('[FOUND] Earlier dates:', foundDates);
-
-    // Проверяем команды
-    const command = await checkTelegramCommands();
-
-    if (command === 'STATUS') {
-      const appt = await getCurrentAppointment();
-      await sendTelegram(
-        `📋 <b>Текущая запись в посольство США</b>\n\n` +
-        `📅 Дата: <b>${appt?.date || CONFIG.currentDate}</b>\n` +
-        `🕐 Время: <b>${appt?.time || 'уточни на сайте'}</b>\n` +
-        `👫 Заявители: муж и жена\n` +
-        `🏢 Посольство: Ташкент\n\n` +
-        `🔍 Бот ищет даты раньше ${CONFIG.currentDate}`
-      );
-      return;
-    }
 
     if (command === 'BOOK') {
       const targetDate = foundDates[0];
