@@ -9,8 +9,7 @@ const CONFIG = {
   country: 'en-uz',
   telegramToken: process.env.TELEGRAM_TOKEN || '8763727275:AAH5oDZ_NxhJL7YgDxQwm0aCJUXp-E9sJpw',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '515561284',
-  targetMonth: '2026-05', // ищем только май 2026
-  currentDate: '2026-08-26' // текущая запись
+  currentDate: '2026-08-26' // текущая запись — ищем любую дату раньше этой
 };
 
 const BASE_URL = 'https://ais.usvisa-info.com';
@@ -204,7 +203,7 @@ async function checkTelegramCommands() {
 }
 
 async function run() {
-  console.log(`[${new Date().toISOString()}] Checking for May 2026 dates...`);
+  console.log(`[${new Date().toISOString()}] Checking for dates earlier than ${CONFIG.currentDate}...`);
 
   await getCsrfToken();
   const loggedIn = await login();
@@ -216,20 +215,20 @@ async function run() {
   const dates = await checkDates();
   if (!dates) return;
 
-  // Фильтруем только май 2026
-  const mayDates = dates.filter(d => d.date && d.date.startsWith(CONFIG.targetMonth));
+  // Ищем любую дату раньше текущей записи
+  const earlierDates = dates.filter(d => d.date && d.date < CONFIG.currentDate);
 
-  if (mayDates.length > 0) {
-    foundDates = mayDates.map(d => d.date);
+  if (earlierDates.length > 0) {
+    foundDates = earlierDates.map(d => d.date);
     const list = foundDates.map(d => `• ${d}`).join('\n');
 
-    const msg = `🗓 <b>Найдены даты в мае 2026!</b>\n\nДоступные даты:\n${list}\n\n` +
+    const msg = `🗓 <b>Найдены более ранние даты!</b>\n\nДоступные даты:\n${list}\n\n` +
       `Твоя текущая дата: ${CONFIG.currentDate}\n\n` +
       `Чтобы <b>автоматически забронировать</b> первую доступную дату,\n` +
       `напиши боту: <b>BOOK</b>`;
 
     await sendTelegram(msg);
-    console.log('[FOUND] May dates:', foundDates);
+    console.log('[FOUND] Earlier dates:', foundDates);
 
     // Проверяем команду BOOK
     const command = await checkTelegramCommands();
@@ -260,7 +259,7 @@ async function run() {
       }
     }
   } else {
-    console.log('[INFO] No May 2026 dates available');
+    console.log('[INFO] No earlier dates available. Current:', CONFIG.currentDate);
   }
 }
 
