@@ -1,4 +1,5 @@
 const axios = require('axios');
+const fs = require('fs');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -8,8 +9,6 @@ const CONFIG = {
   country: 'en-uz',
   telegramToken: process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
-  githubToken: process.env.GITHUB_TOKEN,
-  githubRepo: process.env.GITHUB_REPOSITORY,
 };
 
 // Проверка обязательных переменных
@@ -35,30 +34,21 @@ const client = axios.create({
   },
 });
 
-// ── Состояние (хранится в state.json в репозитории) ───────────────────────────
+// ── Состояние (хранится в кэше GitHub Actions — без коммитов в git) ───────────
 const STATE_FILE = 'state.json';
 let state = {
-  currentDate: '2026-08-26',   // обновляется автоматически при каждом запуске
+  currentDate: '2026-08-26',
   scheduleIds: [],
   lastUpdateId: 0,
   lastNotifiedDates: [],
   pendingBook: false,
-  cookies: '',                  // сохранённая сессия — не входим каждый раз
+  cookies: '',
 };
 
-async function loadState() {
-  if (!CONFIG.githubToken || !CONFIG.githubRepo) {
-    console.log('[STATE] Нет GITHUB_TOKEN — работаю без сохранения состояния');
-    return;
-  }
+function loadState() {
   try {
-    const res = await axios.get(
-      `https://api.github.com/repos/${CONFIG.githubRepo}/contents/${STATE_FILE}`,
-      { headers: { Authorization: `token ${CONFIG.githubToken}`, 'User-Agent': 'visa-bot' } }
-    );
-    const raw = Buffer.from(res.data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    const raw = fs.readFileSync(STATE_FILE, 'utf-8');
     state = { ...state, ...JSON.parse(raw) };
-    state._sha = res.data.sha;
     console.log('[STATE] Загружено:', {
       currentDate: state.currentDate,
       scheduleIds: state.scheduleIds,
@@ -66,27 +56,13 @@ async function loadState() {
       pendingBook: state.pendingBook,
     });
   } catch (e) {
-    if (e.response?.status === 404) {
-      console.log('[STATE] Файл состояния не найден, используется начальное состояние');
-    } else {
-      console.log('[STATE] Ошибка загрузки:', e.message);
-    }
+    console.log('[STATE] Файл не найден, используем начальные значения');
   }
 }
 
-async function saveState() {
-  if (!CONFIG.githubToken || !CONFIG.githubRepo) return;
+function saveState() {
   try {
-    const { _sha, ...toSave } = state;
-    const content = Buffer.from(JSON.stringify(toSave, null, 2)).toString('base64');
-    const body = { message: 'chore: update bot state', content };
-    if (_sha) body.sha = _sha;
-    const res = await axios.put(
-      `https://api.github.com/repos/${CONFIG.githubRepo}/contents/${STATE_FILE}`,
-      body,
-      { headers: { Authorization: `token ${CONFIG.githubToken}`, 'User-Agent': 'visa-bot' } }
-    );
-    state._sha = res.data.content.sha;
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
     console.log('[STATE] Сохранено');
   } catch (e) {
     console.log('[STATE] Ошибка сохранения:', e.message);
@@ -415,7 +391,7 @@ async function attemptBooking(targetDate) {
 async function run() {
   console.log(`[${new Date().toISOString()}] Запуск...`);
 
-  await loadState();
+  loadState();
 
   // Восстанавливаем сохранённые cookies из state
   if (state.cookies) cookies = state.cookies;
@@ -430,7 +406,7 @@ async function run() {
     if (!loggedIn) {
       console.log('[ERR] Не удалось войти');
       await sendTelegram('⚠️ Бот не смог войти в систему. Возможно, изменился пароль или сессия заблокирована.');
-      await saveState();
+      saveState();
       return;
     }
     state.cookies = cookies; // сохраняем новую сессию
@@ -441,7 +417,7 @@ async function run() {
     const found = await getScheduleIds();
     if (!found) {
       console.log('[ERR] Не найдены Schedule ID');
-      await saveState();
+      saveState();
       return;
     }
   }
@@ -473,7 +449,7 @@ async function run() {
       `⏱ Проверка каждые 5 минут.\n` +
       `Уведомление придёт, когда найдётся дата раньше <b>${state.currentDate}</b>.`
     );
-    await saveState();
+    saveState();
     return;
   }
 
@@ -487,14 +463,14 @@ async function run() {
       `🔍 Ищу даты раньше <b>${state.currentDate}</b>\n` +
       (state.pendingBook ? `⏳ Режим автобронирования активен (CANCEL для отмены)` : '')
     );
-    await saveState();
+    saveState();
     return;
   }
 
   if (command === 'CANCEL') {
     state.pendingBook = false;
     await sendTelegram('❌ Автобронирование отменено. Продолжаю мониторинг.');
-    await saveState();
+    saveState();
     return;
   }
 
@@ -513,7 +489,7 @@ async function run() {
         `\n\n✅ раньше твоей (${state.currentDate})\n📌 позже твоей`
       );
     }
-    await saveState();
+    saveState();
     return;
   }
 
@@ -537,7 +513,7 @@ async function run() {
         `или <b>CANCEL</b> для отмены.`
       );
     }
-    await saveState();
+    saveState();
     return;
   }
 
@@ -554,14 +530,14 @@ async function run() {
       await sendTelegram(`⏳ Бронирую <b>${earlier[0].date}</b>...`);
       await attemptBooking(earlier[0].date);
     }
-    await saveState();
+    saveState();
     return;
   }
 
   // ── Плановый мониторинг ─────────────────────────────────────────────────────
   console.log(`[INFO] Ищу даты раньше ${state.currentDate}...`);
   const dates = await checkAllDates();
-  if (dates === null) { await saveState(); return; }
+  if (dates === null) { saveState(); return; }
 
   const earlier = dates
     .filter(d => d.date && d.date < state.currentDate)
@@ -604,7 +580,7 @@ async function run() {
 
   // Сохраняем актуальные cookies перед выходом
   state.cookies = cookies;
-  await saveState();
+  saveState();
 }
 
 run().catch(async e => {
