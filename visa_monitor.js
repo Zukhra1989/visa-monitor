@@ -228,7 +228,7 @@ async function fetchDatesForId(scheduleId) {
         },
       }
     );
-    return res.data || [];
+    return Array.isArray(res.data) ? res.data : [];
   } catch (e) {
     console.log(`[ERR] Даты для ${scheduleId}:`, e.message);
     return null;
@@ -241,7 +241,7 @@ async function checkAllDates() {
   if (ids.length === 0) return [];
 
   const results = await Promise.all(ids.map(id => fetchDatesForId(id)));
-  const valid = results.filter(r => r !== null);
+  const valid = results.filter(r => Array.isArray(r));
   if (valid.length === 0) return null;
   if (valid.length === 1) return valid[0];
 
