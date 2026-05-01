@@ -2,7 +2,7 @@ name: Visa Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 * * * *'   # раз в час — внутри скрипт сам крутится 55 минут
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
 
