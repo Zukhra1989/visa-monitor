@@ -451,37 +451,38 @@ async function reportHeartbeat() {
   console.log('[HEARTBEAT] Отправлен ежедневный отчёт');
 }
 
-// ── Главная функция ───────────────────────────────────────────────────────────
-async function run() {
-  console.log(`[${new Date().toISOString()}] Запуск...`);
-
+// ── Инициализация сессии (один раз при старте) ────────────────────────────────
+async function setupSession() {
   loadState();
-
-  // Восстанавливаем сохранённые cookies из state
   if (state.cookies) cookies = state.cookies;
 
-  // Проверяем сессию — входим только если она истекла
   const sessionOk = await isSessionValid();
   if (sessionOk) {
-    console.log('[AUTH] Сессия активна, вход не нужен');
+    console.log('[AUTH] Сессия активна');
   } else {
     console.log('[AUTH] Сессия истекла, выполняю вход...');
     const loggedIn = await login();
     if (!loggedIn) {
       await reportError('Не удалось войти — неверный пароль или сайт заблокировал доступ');
-      return;
+      return false;
     }
     state.cookies = cookies;
-    console.log('[AUTH] Вход выполнен, сессия сохранена');
+    console.log('[AUTH] Вход выполнен');
   }
 
   if (!state.scheduleIds || state.scheduleIds.length === 0) {
     const found = await getScheduleIds();
     if (!found) {
       await reportError('Не найдены Schedule ID — возможно изменилась структура сайта');
-      return;
+      return false;
     }
   }
+  return true;
+}
+
+// ── Одна итерация проверки (вызывается каждые 30 сек) ────────────────────────
+async function check() {
+  console.log(`[${new Date().toISOString()}] Проверка...`);
 
   // Обновляем текущую дату записи с сайта
   const appt = await getCurrentAppointment();
@@ -658,18 +659,48 @@ async function run() {
     console.log('[INFO] Нет дат раньше', state.currentDate);
   }
 
-  // Всё прошло успешно — сбрасываем счётчик ошибок
   resetFailStreak();
-
-  // Ежедневный отчёт о работе бота
   await reportHeartbeat();
-
-  // Сохраняем актуальные cookies перед выходом
   state.cookies = cookies;
   saveState();
 }
 
-run().catch(async e => {
+// ── Главный цикл: 55 минут, проверка каждые 30 секунд ────────────────────────
+async function main() {
+  const LOOP_MS  = 55 * 60 * 1000;   // 55 минут
+  const PAUSE_MS = 30 * 1000;        // 30 секунд между проверками
+
+  const ready = await setupSession();
+  if (!ready) return;
+
+  const endTime = Date.now() + LOOP_MS;
+  console.log(`[LOOP] Работаю до ${new Date(endTime).toISOString()} (проверка каждые 30 сек)`);
+
+  while (Date.now() < endTime) {
+    const start = Date.now();
+    try {
+      await check();
+    } catch (e) {
+      console.error('[LOOP ERR]', e.message);
+      // При ошибке авторизации — перелогиниваемся
+      if (e.response?.status === 401 || e.response?.status === 403) {
+        console.log('[AUTH] Сессия слетела, перелогиниваюсь...');
+        const ok = await login();
+        if (ok) { state.cookies = cookies; saveState(); }
+      }
+    }
+
+    const remaining = endTime - Date.now();
+    const sleep = Math.min(PAUSE_MS, remaining);
+    if (sleep > 0) await new Promise(r => setTimeout(r, sleep));
+  }
+
+  console.log('[LOOP] 55 минут истекли, завершаю работу');
+  state.cookies = cookies;
+  saveState();
+}
+
+main().catch(e => {
   console.error('[FATAL]', e.message);
   process.exit(1);
 });
