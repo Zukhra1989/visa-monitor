@@ -43,6 +43,7 @@ let state = {
   lastUpdateId: 0,
   lastNotifiedDates: [],
   pendingBook: false,
+  cookies: '',                  // сохранённая сессия — не входим каждый раз
 };
 
 async function loadState() {
@@ -143,6 +144,25 @@ async function checkTelegramCommands() {
 }
 
 // ── Авторизация ───────────────────────────────────────────────────────────────
+
+// Проверяет живы ли сохранённые cookies — без нового входа
+async function isSessionValid() {
+  if (!cookies) return false;
+  try {
+    const res = await client.get(`/${CONFIG.country}/niv/account`, {
+      headers: { Cookie: cookies },
+      maxRedirects: 0,
+      validateStatus: s => s < 500,
+    });
+    // Редирект на sign_in означает что сессия истекла
+    if (res.status === 302) return false;
+    const isLoginPage = res.data && res.data.includes('sign_in');
+    return res.status === 200 && !isLoginPage;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function getCsrfAndCookies() {
   try {
     const res = await client.get(`/${CONFIG.country}/niv/users/sign_in`);
@@ -396,12 +416,24 @@ async function run() {
 
   await loadState();
 
-  const loggedIn = await login();
-  if (!loggedIn) {
-    console.log('[ERR] Не удалось войти');
-    await sendTelegram('⚠️ Бот не смог войти в систему. Возможно, изменился пароль или сессия заблокирована.');
-    await saveState();
-    return;
+  // Восстанавливаем сохранённые cookies из state
+  if (state.cookies) cookies = state.cookies;
+
+  // Проверяем сессию — входим только если она истекла
+  const sessionOk = await isSessionValid();
+  if (sessionOk) {
+    console.log('[AUTH] Сессия активна, вход не нужен');
+  } else {
+    console.log('[AUTH] Сессия истекла, выполняю вход...');
+    const loggedIn = await login();
+    if (!loggedIn) {
+      console.log('[ERR] Не удалось войти');
+      await sendTelegram('⚠️ Бот не смог войти в систему. Возможно, изменился пароль или сессия заблокирована.');
+      await saveState();
+      return;
+    }
+    state.cookies = cookies; // сохраняем новую сессию
+    console.log('[AUTH] Вход выполнен, сессия сохранена');
   }
 
   if (!state.scheduleIds || state.scheduleIds.length === 0) {
@@ -569,6 +601,8 @@ async function run() {
     console.log('[INFO] Нет дат раньше', state.currentDate);
   }
 
+  // Сохраняем актуальные cookies перед выходом
+  state.cookies = cookies;
   await saveState();
 }
 
