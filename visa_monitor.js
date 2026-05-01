@@ -43,7 +43,9 @@ let state = {
   lastNotifiedDates: [],
   pendingBook: false,
   cookies: '',
-  preferredTime: '',   // желаемое время записи, напр. "10:00"
+  preferredTime: '',
+  failStreak: 0,         // счётчик подряд идущих ошибок
+  lastHeartbeat: 0,      // timestamp последнего ежедневного отчёта
 };
 
 function loadState() {
@@ -406,6 +408,49 @@ async function attemptBooking(targetDate) {
   }
 }
 
+// ── Мониторинг здоровья бота ──────────────────────────────────────────────────
+
+// Вызывать при каждой ошибке — уведомляет после 3 подряд неудач
+async function reportError(reason) {
+  state.failStreak = (state.failStreak || 0) + 1;
+  console.log(`[ERR] ${reason} (подряд: ${state.failStreak})`);
+  if (state.failStreak >= 3) {
+    await sendTelegram(
+      `🚨 <b>Бот не работает ${state.failStreak} запуска подряд!</b>\n\n` +
+      `❌ Причина: ${reason}\n\n` +
+      `Проверь:\n` +
+      `• Не изменился ли пароль на сайте посольства\n` +
+      `• Не заблокировал ли сайт доступ\n` +
+      `• Статус GitHub Actions: https://githubstatus.com`
+    );
+  }
+  saveState();
+}
+
+// Сбрасывает счётчик ошибок при успешном запуске
+function resetFailStreak() {
+  if (state.failStreak > 0) {
+    console.log(`[OK] Ошибки устранены (было ${state.failStreak} подряд)`);
+    state.failStreak = 0;
+  }
+}
+
+// Отправляет раз в 24 часа подтверждение что бот живой
+async function reportHeartbeat() {
+  const now = Date.now();
+  const hours24 = 24 * 60 * 60 * 1000;
+  if (now - (state.lastHeartbeat || 0) < hours24) return;
+  state.lastHeartbeat = now;
+  await sendTelegram(
+    `💚 <b>Бот работает нормально</b>\n\n` +
+    `📅 Слежу за датами раньше: <b>${state.currentDate}</b>\n` +
+    `🕐 Желаемое время: <b>${state.preferredTime || 'не задано'}</b>\n` +
+    `⏱ Проверка каждые 5 минут\n\n` +
+    `_Это автоматическое сообщение раз в 24 часа_`
+  );
+  console.log('[HEARTBEAT] Отправлен ежедневный отчёт');
+}
+
 // ── Главная функция ───────────────────────────────────────────────────────────
 async function run() {
   console.log(`[${new Date().toISOString()}] Запуск...`);
@@ -423,20 +468,17 @@ async function run() {
     console.log('[AUTH] Сессия истекла, выполняю вход...');
     const loggedIn = await login();
     if (!loggedIn) {
-      console.log('[ERR] Не удалось войти');
-      await sendTelegram('⚠️ Бот не смог войти в систему. Возможно, изменился пароль или сессия заблокирована.');
-      saveState();
+      await reportError('Не удалось войти — неверный пароль или сайт заблокировал доступ');
       return;
     }
-    state.cookies = cookies; // сохраняем новую сессию
+    state.cookies = cookies;
     console.log('[AUTH] Вход выполнен, сессия сохранена');
   }
 
   if (!state.scheduleIds || state.scheduleIds.length === 0) {
     const found = await getScheduleIds();
     if (!found) {
-      console.log('[ERR] Не найдены Schedule ID');
-      saveState();
+      await reportError('Не найдены Schedule ID — возможно изменилась структура сайта');
       return;
     }
   }
@@ -615,6 +657,12 @@ async function run() {
     }
     console.log('[INFO] Нет дат раньше', state.currentDate);
   }
+
+  // Всё прошло успешно — сбрасываем счётчик ошибок
+  resetFailStreak();
+
+  // Ежедневный отчёт о работе бота
+  await reportHeartbeat();
 
   // Сохраняем актуальные cookies перед выходом
   state.cookies = cookies;
