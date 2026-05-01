@@ -376,35 +376,50 @@ async function attemptBooking(targetDate) {
 
   const selectedTime = pickBestTime(times);
   const wasPreferred = state.preferredTime && selectedTime === state.preferredTime;
-  console.log(`[BOOKING] Выбрано время: ${selectedTime}${state.preferredTime ? ` (желаемое: ${state.preferredTime})` : ''}`);
+  console.log(`[BOOKING] Бронирую ${targetDate} ${selectedTime}...`);
 
-  const results = await bookAll(targetDate, selectedTime);
-  const successCount = results.filter(r => r.ok).length;
-  const total = results.length;
+  await bookAll(targetDate, selectedTime);
 
-  if (successCount === total) {
+  // Проверяем реальный результат — читаем дату с сайта
+  await new Promise(r => setTimeout(r, 3000)); // ждём пока сайт обновится
+  const actual = await getCurrentAppointment();
+  const actualISO = actual ? toISODate(actual.date) : null;
+
+  console.log(`[BOOKING] Целевая дата: ${targetDate}, реальная на сайте: ${actualISO}`);
+
+  if (actualISO === targetDate) {
+    // Сайт подтвердил новую дату — успех
     state.currentDate = targetDate;
     state.pendingBook = false;
     await sendTelegram(
-      `✅ <b>Запись успешно перенесена!</b>\n\n` +
+      `✅ <b>Запись подтверждена сайтом!</b>\n\n` +
       `📅 Новая дата: <b>${targetDate}</b>\n` +
-      `🕐 Время: <b>${selectedTime}</b>${state.preferredTime && !wasPreferred ? ` (ближайшее к ${state.preferredTime})` : ''}\n` +
+      `🕐 Время: <b>${actual?.time || selectedTime}</b>` +
+      `${state.preferredTime && !wasPreferred ? ` (ближайшее к ${state.preferredTime})` : ''}\n` +
       `👫 Записаны: муж и жена\n\n` +
-      `🔗 Проверь: https://ais.usvisa-info.com/en-uz/niv`
-    );
-    console.log('[SUCCESS] Забронировано:', targetDate, selectedTime);
-  } else if (successCount > 0) {
-    state.pendingBook = false;
-    await sendTelegram(
-      `⚠️ <b>Частичная запись!</b>\n\n` +
-      `📅 ${targetDate} 🕐 ${selectedTime}\n` +
-      `Записано ${successCount} из ${total}.\n\n` +
-      `❗ Зайди на сайт и проверь вручную!\n` +
       `🔗 https://ais.usvisa-info.com/en-uz/niv`
     );
+    console.log('[SUCCESS] Сайт подтвердил бронирование:', targetDate);
+  } else if (actualISO && actualISO !== state.currentDate) {
+    // Сайт показывает другую новую дату — тоже успех, но неожиданный
+    state.currentDate = actualISO;
+    state.pendingBook = false;
+    await sendTelegram(
+      `⚠️ <b>Запись изменена, но дата отличается!</b>\n\n` +
+      `Пытались забронировать: <b>${targetDate}</b>\n` +
+      `Реальная запись на сайте: <b>${actualISO}</b> ${actual?.time || ''}\n\n` +
+      `❗ Зайди и проверь: https://ais.usvisa-info.com/en-uz/niv`
+    );
   } else {
+    // Сайт показывает старую дату — бронирование не прошло
     state.pendingBook = true;
-    await sendTelegram(`❌ Ошибка бронирования ${targetDate}. Повторю при следующей проверке.`);
+    await sendTelegram(
+      `❌ <b>Бронирование не подтверждено!</b>\n\n` +
+      `Пытались забронировать: <b>${targetDate}</b>\n` +
+      `Сайт всё ещё показывает: <b>${actualISO || state.currentDate}</b>\n\n` +
+      `Повторю при следующей проверке.`
+    );
+    console.log('[FAIL] Сайт не подтвердил бронирование');
   }
 }
 
