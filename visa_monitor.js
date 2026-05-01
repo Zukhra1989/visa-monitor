@@ -119,10 +119,9 @@ async function checkTelegramCommands() {
     // Сохраняем последний update_id чтобы не читать эти сообщения снова
     state.lastUpdateId = Math.max(...updates.map(u => u.update_id));
 
-    const now = Math.floor(Date.now() / 1000);
-    // Берём только сообщения за последние 10 минут, сначала новые
+    // Берём все новые сообщения (offset защищает от повторов), сначала новые
     const recent = updates
-      .filter(u => u.message && (now - u.message.date) < 600)
+      .filter(u => u.message)
       .reverse();
 
     for (const upd of recent) {
