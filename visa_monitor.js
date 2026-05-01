@@ -149,16 +149,17 @@ async function checkTelegramCommands() {
 async function isSessionValid() {
   if (!cookies) return false;
   try {
-    const res = await client.get(`/${CONFIG.country}/niv/account`, {
+    const res = await client.get(`/${CONFIG.country}/niv`, {
       headers: { Cookie: cookies },
-      maxRedirects: 0,
+      maxRedirects: 5,
       validateStatus: s => s < 500,
     });
-    // Редирект на sign_in означает что сессия истекла
-    if (res.status === 302) return false;
-    const isLoginPage = res.data && res.data.includes('sign_in');
-    return res.status === 200 && !isLoginPage;
+    // Если залогинены — на странице есть ссылка "sign_out"
+    const loggedIn = res.data && res.data.includes('sign_out');
+    console.log(`[AUTH] Проверка сессии: ${loggedIn ? 'активна' : 'истекла'}`);
+    return loggedIn;
   } catch (e) {
+    console.log('[AUTH] Ошибка проверки сессии:', e.message);
     return false;
   }
 }
