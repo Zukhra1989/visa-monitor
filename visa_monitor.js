@@ -1,21 +1,28 @@
 const axios = require('axios');
-const https = require('https');
 
+// ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
-  email: process.env.VISA_EMAIL || 'jxusenov@list.ru',
-  password: process.env.VISA_PASSWORD || '212Aziko@Zuxa1989@',
-  scheduleIds: [], // оба ID (муж и жена)
+  email: process.env.VISA_EMAIL,
+  password: process.env.VISA_PASSWORD,
   facilityId: 90,
   country: 'en-uz',
-  telegramToken: process.env.TELEGRAM_TOKEN || '8763727275:AAH5oDZ_NxhJL7YgDxQwm0aCJUXp-E9sJpw',
-  telegramChatId: process.env.TELEGRAM_CHAT_ID || '515561284',
-  currentDate: '2026-08-26' // текущая запись — ищем любую дату раньше этой
+  telegramToken: process.env.TELEGRAM_TOKEN,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID,
+  githubToken: process.env.GITHUB_TOKEN,
+  githubRepo: process.env.GITHUB_REPOSITORY,
 };
+
+// Проверка обязательных переменных
+const missing = ['email', 'password', 'telegramToken', 'telegramChatId']
+  .filter(k => !CONFIG[k]);
+if (missing.length) {
+  console.error('[FATAL] Не заданы переменные окружения:', missing.map(k => k.toUpperCase()).join(', '));
+  process.exit(1);
+}
 
 const BASE_URL = 'https://ais.usvisa-info.com';
 let cookies = '';
 let csrfToken = '';
-let foundDates = [];
 
 const client = axios.create({
   baseURL: BASE_URL,
@@ -24,24 +31,120 @@ const client = axios.create({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': BASE_URL
+    'Referer': BASE_URL,
   },
-  httpsAgent: new https.Agent({ rejectUnauthorized: false })
 });
 
+// ── Состояние (хранится в state.json в репозитории) ───────────────────────────
+const STATE_FILE = 'state.json';
+let state = {
+  currentDate: '2026-08-26',   // обновляется автоматически при каждом запуске
+  scheduleIds: [],
+  lastUpdateId: 0,
+  lastNotifiedDates: [],
+  pendingBook: false,
+};
+
+async function loadState() {
+  if (!CONFIG.githubToken || !CONFIG.githubRepo) {
+    console.log('[STATE] Нет GITHUB_TOKEN — работаю без сохранения состояния');
+    return;
+  }
+  try {
+    const res = await axios.get(
+      `https://api.github.com/repos/${CONFIG.githubRepo}/contents/${STATE_FILE}`,
+      { headers: { Authorization: `token ${CONFIG.githubToken}`, 'User-Agent': 'visa-bot' } }
+    );
+    const raw = Buffer.from(res.data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    state = { ...state, ...JSON.parse(raw) };
+    state._sha = res.data.sha;
+    console.log('[STATE] Загружено:', {
+      currentDate: state.currentDate,
+      scheduleIds: state.scheduleIds,
+      lastUpdateId: state.lastUpdateId,
+      pendingBook: state.pendingBook,
+    });
+  } catch (e) {
+    if (e.response?.status === 404) {
+      console.log('[STATE] Файл состояния не найден, используется начальное состояние');
+    } else {
+      console.log('[STATE] Ошибка загрузки:', e.message);
+    }
+  }
+}
+
+async function saveState() {
+  if (!CONFIG.githubToken || !CONFIG.githubRepo) return;
+  try {
+    const { _sha, ...toSave } = state;
+    const content = Buffer.from(JSON.stringify(toSave, null, 2)).toString('base64');
+    const body = { message: 'chore: update bot state', content };
+    if (_sha) body.sha = _sha;
+    const res = await axios.put(
+      `https://api.github.com/repos/${CONFIG.githubRepo}/contents/${STATE_FILE}`,
+      body,
+      { headers: { Authorization: `token ${CONFIG.githubToken}`, 'User-Agent': 'visa-bot' } }
+    );
+    state._sha = res.data.content.sha;
+    console.log('[STATE] Сохранено');
+  } catch (e) {
+    console.log('[STATE] Ошибка сохранения:', e.message);
+  }
+}
+
+// ── Telegram ──────────────────────────────────────────────────────────────────
 async function sendTelegram(message) {
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.telegramToken}/sendMessage`, {
       chat_id: CONFIG.telegramChatId,
       text: message,
-      parse_mode: 'HTML'
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
     });
   } catch (e) {
-    console.log('[TG] Error:', e.message);
+    console.log('[TG] Ошибка отправки:', e.message);
   }
 }
 
-async function getCsrfToken() {
+// Читает новые команды с учётом offset — не повторяет уже обработанные сообщения
+async function checkTelegramCommands() {
+  try {
+    const offset = state.lastUpdateId > 0 ? `&offset=${state.lastUpdateId + 1}` : '';
+    const res = await axios.get(
+      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=20&timeout=1${offset}`
+    );
+    const updates = res.data.result || [];
+    if (updates.length === 0) return null;
+
+    // Сохраняем последний update_id чтобы не читать эти сообщения снова
+    state.lastUpdateId = Math.max(...updates.map(u => u.update_id));
+
+    const now = Math.floor(Date.now() / 1000);
+    // Берём только сообщения за последние 10 минут, сначала новые
+    const recent = updates
+      .filter(u => u.message && (now - u.message.date) < 600)
+      .reverse();
+
+    for (const upd of recent) {
+      const text = upd.message?.text?.toUpperCase().trim();
+      const chatId = upd.message?.chat?.id?.toString();
+      if (chatId !== CONFIG.telegramChatId) continue;
+
+      if (text === '/START' || text === 'START' || text === '/HELP' || text === 'HELP') return 'HELP';
+      if (text === 'STATUS')   return 'STATUS';
+      if (text === 'DATES')    return 'DATES';
+      if (text === 'BOOK')     return 'BOOK';
+      if (text === 'BOOK_YES') return 'BOOK_YES';
+      if (text === 'CANCEL')   return 'CANCEL';
+    }
+  } catch (e) {
+    console.log('[TG] Ошибка getUpdates:', e.message);
+  }
+  return null;
+}
+
+// ── Авторизация ───────────────────────────────────────────────────────────────
+async function getCsrfAndCookies() {
   try {
     const res = await client.get(`/${CONFIG.country}/niv/users/sign_in`);
     const match = res.data.match(/csrf-token"\s+content="([^"]+)"/);
@@ -51,304 +154,426 @@ async function getCsrfToken() {
       if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
       return true;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.log('[ERR] getCsrf:', e.message);
+  }
   return false;
 }
 
 async function login() {
+  const ok = await getCsrfAndCookies();
+  if (!ok) return false;
   try {
-    const params = new URLSearchParams();
-    params.append('user[email]', CONFIG.email);
-    params.append('user[password]', CONFIG.password);
-    params.append('policy_confirmed', '1');
-    params.append('commit', 'Sign In');
-
+    const params = new URLSearchParams({
+      'user[email]': CONFIG.email,
+      'user[password]': CONFIG.password,
+      policy_confirmed: '1',
+      commit: 'Sign In',
+    });
     const res = await client.post(`/${CONFIG.country}/niv/users/sign_in`, params.toString(), {
       headers: {
         'X-CSRF-Token': csrfToken,
         'Cookie': cookies,
         'Content-Type': 'application/x-www-form-urlencoded',
         'X-Requested-With': 'XMLHttpRequest',
-        'Accept': 'application/json, text/javascript, */*; q=0.01'
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
       },
-      maxRedirects: 5
+      maxRedirects: 5,
     });
-
     const setCookie = res.headers['set-cookie'];
     if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
-    return res.status === 200 || res.status === 302;
+    return true;
   } catch (e) {
-    if (e.response && (e.response.status === 200 || e.response.status === 302)) {
+    if (e.response && [200, 302].includes(e.response.status)) {
       const setCookie = e.response.headers['set-cookie'];
       if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
       return true;
     }
+    console.log('[ERR] Login:', e.message);
+    return false;
   }
-  return false;
 }
 
 async function getScheduleIds() {
-  const endpoints = [`/${CONFIG.country}/niv/account`, `/${CONFIG.country}/niv/dashboard`, `/${CONFIG.country}/niv`];
+  const endpoints = [
+    `/${CONFIG.country}/niv/account`,
+    `/${CONFIG.country}/niv/dashboard`,
+    `/${CONFIG.country}/niv`,
+  ];
   for (const ep of endpoints) {
     try {
-      const res = await client.get(ep, { headers: { 'Cookie': cookies } });
+      const res = await client.get(ep, { headers: { Cookie: cookies } });
       const matches = [...res.data.matchAll(/\/schedule\/(\d+)\//g)];
       const ids = [...new Set(matches.map(m => m[1]))];
       if (ids.length > 0) {
-        CONFIG.scheduleIds = ids;
+        state.scheduleIds = ids;
         console.log('[OK] Schedule IDs найдены:', ids);
         return true;
       }
-    } catch (e) {}
+    } catch (e) { /* пробуем следующий endpoint */ }
   }
   return false;
 }
 
-async function checkDates() {
-  const scheduleId = CONFIG.scheduleIds[0];
+// ── Проверка дат ──────────────────────────────────────────────────────────────
+async function fetchDatesForId(scheduleId) {
   try {
     const res = await client.get(
       `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment/days/${CONFIG.facilityId}.json?appointments[expedite]=false`,
       {
         headers: {
-          'Cookie': cookies,
+          Cookie: cookies,
           'X-Requested-With': 'XMLHttpRequest',
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
-        }
+          Referer: `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
+        },
       }
     );
-    if (res.data && res.data.length > 0) return res.data;
-    return [];
+    return res.data || [];
   } catch (e) {
-    console.log('[ERR] Dates:', e.message);
+    console.log(`[ERR] Даты для ${scheduleId}:`, e.message);
     return null;
   }
 }
 
-async function getTimeSlots(date) {
-  const scheduleId = CONFIG.scheduleIds[0];
+// Возвращает даты доступные ОДНОВРЕМЕННО для всех участников (пересечение)
+async function checkAllDates() {
+  const ids = state.scheduleIds || [];
+  if (ids.length === 0) return [];
+
+  const results = await Promise.all(ids.map(id => fetchDatesForId(id)));
+  const valid = results.filter(r => r !== null);
+  if (valid.length === 0) return null;
+  if (valid.length === 1) return valid[0];
+
+  // Пересечение: только даты у которых слоты есть для ВСЕХ ID
+  const sets = valid.map(dates => new Set(dates.map(d => d.date)));
+  const common = [...sets[0]].filter(date => sets.every(s => s.has(date)));
+  console.log(`[INFO] ID1: ${valid[0].length} дат, ID2: ${valid[1]?.length ?? '?'} дат, общих: ${common.length}`);
+  return common.map(date => ({ date }));
+}
+
+async function getTimeSlots(scheduleId, date) {
   try {
     const res = await client.get(
       `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment/times/${CONFIG.facilityId}.json?date=${date}&appointments[expedite]=false`,
       {
         headers: {
-          'Cookie': cookies,
+          Cookie: cookies,
           'X-Requested-With': 'XMLHttpRequest',
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
-        }
+          Referer: `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
+        },
       }
     );
-    if (res.data && res.data.available_times && res.data.available_times.length > 0) {
-      return res.data.available_times;
-    }
-    return [];
+    return res.data?.available_times || [];
   } catch (e) {
-    console.log('[ERR] Times:', e.message);
+    console.log('[ERR] Время:', e.message);
     return [];
   }
 }
 
+async function getCurrentAppointment() {
+  const scheduleId = (state.scheduleIds || [])[0];
+  if (!scheduleId) return null;
+  try {
+    const res = await client.get(`/${CONFIG.country}/niv/schedule/${scheduleId}`, {
+      headers: { Cookie: cookies },
+    });
+    const m = res.data.match(/(\d{1,2}\s+\w+,\s+\d{4}),\s+(\d{2}:\d{2})/);
+    if (m) return { date: m[1].trim(), time: m[2].trim() };
+  } catch (e) {
+    console.log('[ERR] getCurrentAppointment:', e.message);
+  }
+  return null;
+}
+
+// Конвертирует "26 August, 2026" -> "2026-08-26"
+function toISODate(str) {
+  const months = {
+    January: '01', February: '02', March: '03', April: '04',
+    May: '05', June: '06', July: '07', August: '08',
+    September: '09', October: '10', November: '11', December: '12',
+  };
+  const m = str?.match(/(\d{1,2})\s+(\w+),?\s+(\d{4})/);
+  if (!m) return null;
+  const month = months[m[2]];
+  if (!month) return null;
+  return `${m[3]}-${month}-${m[1].padStart(2, '0')}`;
+}
+
+// ── Бронирование ──────────────────────────────────────────────────────────────
 async function bookOneAppointment(scheduleId, date, time) {
   try {
     const pageRes = await client.get(
       `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
-      { headers: { 'Cookie': cookies } }
+      { headers: { Cookie: cookies } }
     );
     const csrfMatch = pageRes.data.match(/csrf-token"\s+content="([^"]+)"/);
     if (csrfMatch) csrfToken = csrfMatch[1];
 
-    const params = new URLSearchParams();
-    params.append('authenticity_token', csrfToken);
-    params.append('confirmed_limit_message', '1');
-    params.append('use_consulate_appointment_capacity', 'true');
-    params.append('appointments[consulate_appointment][facility_id]', CONFIG.facilityId);
-    params.append('appointments[consulate_appointment][date]', date);
-    params.append('appointments[consulate_appointment][time]', time);
+    const params = new URLSearchParams({
+      authenticity_token: csrfToken,
+      confirmed_limit_message: '1',
+      use_consulate_appointment_capacity: 'true',
+      'appointments[consulate_appointment][facility_id]': String(CONFIG.facilityId),
+      'appointments[consulate_appointment][date]': date,
+      'appointments[consulate_appointment][time]': time,
+    });
 
     const res = await client.post(
       `/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
       params.toString(),
       {
         headers: {
-          'Cookie': cookies,
+          Cookie: cookies,
           'Content-Type': 'application/x-www-form-urlencoded',
           'X-CSRF-Token': csrfToken,
-          'Referer': `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`
+          Referer: `${BASE_URL}/${CONFIG.country}/niv/schedule/${scheduleId}/appointment`,
         },
-        maxRedirects: 5
+        maxRedirects: 5,
       }
     );
-
-    return res.status === 200 || res.status === 302;
+    return [200, 302].includes(res.status);
   } catch (e) {
-    console.log(`[ERR] Booking ${scheduleId}:`, e.message);
+    console.log(`[ERR] Бронирование ${scheduleId}:`, e.message);
     return false;
   }
 }
 
-async function bookBothAppointments(date, time) {
+async function bookAll(date, time) {
   const results = [];
-  for (const scheduleId of CONFIG.scheduleIds) {
-    console.log(`[BOOKING] Бронирую для ID ${scheduleId}: ${date} ${time}`);
+  for (const scheduleId of (state.scheduleIds || [])) {
+    console.log(`[BOOKING] ID ${scheduleId}: ${date} ${time}`);
     const ok = await bookOneAppointment(scheduleId, date, time);
     results.push({ scheduleId, ok });
-    await new Promise(r => setTimeout(r, 2000)); // пауза между запросами
+    if (state.scheduleIds.indexOf(scheduleId) < state.scheduleIds.length - 1) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
   }
   return results;
 }
 
-async function getCurrentAppointment() {
-  const scheduleId = CONFIG.scheduleIds[0];
-  try {
-    const res = await client.get(
-      `/${CONFIG.country}/niv/schedule/${scheduleId}`,
-      { headers: { 'Cookie': cookies } }
+async function attemptBooking(targetDate) {
+  const firstId = (state.scheduleIds || [])[0];
+  const times = await getTimeSlots(firstId, targetDate);
+  if (times.length === 0) {
+    await sendTelegram('❌ Нет доступного времени для этой даты. Повторю при следующей проверке.');
+    state.pendingBook = true; // оставляем флаг — попробуем снова
+    return;
+  }
+
+  const results = await bookAll(targetDate, times[0]);
+  const successCount = results.filter(r => r.ok).length;
+  const total = results.length;
+
+  if (successCount === total) {
+    state.currentDate = targetDate;
+    state.pendingBook = false;
+    await sendTelegram(
+      `✅ <b>Запись успешно перенесена!</b>\n\n` +
+      `📅 Новая дата: <b>${targetDate}</b>\n` +
+      `🕐 Время: <b>${times[0]}</b>\n` +
+      `👫 Записаны: муж и жена\n\n` +
+      `🔗 Проверь: https://ais.usvisa-info.com/en-uz/niv`
     );
-    const html = res.data;
-
-    // Формат на сайте: "26 August, 2026, 09:00 Tashkent local time"
-    const m = html.match(/(\d{1,2}\s+\w+,\s+\d{4}),\s+(\d{2}:\d{2})/);
-    if (m) {
-      console.log('[OK] Appointment:', m[1], m[2]);
-      return { date: m[1].trim(), time: m[2].trim() };
-    }
-
-    console.log('[INFO] Date not found on page');
-    return null;
-  } catch (e) {
-    console.log('[ERR] getCurrentAppointment:', e.message);
-    return null;
+    console.log('[SUCCESS] Забронировано:', targetDate, times[0]);
+  } else if (successCount > 0) {
+    state.pendingBook = false;
+    await sendTelegram(
+      `⚠️ <b>Частичная запись!</b>\n\n` +
+      `📅 ${targetDate} 🕐 ${times[0]}\n` +
+      `Записано ${successCount} из ${total}.\n\n` +
+      `❗ Зайди на сайт и проверь вручную!\n` +
+      `🔗 https://ais.usvisa-info.com/en-uz/niv`
+    );
+  } else {
+    state.pendingBook = true; // повторим при следующем запуске
+    await sendTelegram(`❌ Ошибка бронирования ${targetDate}. Повторю при следующей проверке.`);
   }
 }
 
-async function checkTelegramCommands() {
-  try {
-    const res = await axios.get(
-      `https://api.telegram.org/bot${CONFIG.telegramToken}/getUpdates?limit=20&timeout=1`
-    );
-    const updates = res.data.result || [];
-    const now = Math.floor(Date.now() / 1000);
-
-    // Берём только сообщения за последние 10 минут, самое новое последним
-    const recent = updates
-      .filter(u => u.message && (now - u.message.date) < 600)
-      .reverse();
-
-    for (const update of recent) {
-      const text = update.message?.text?.toUpperCase().trim();
-      const chatId = update.message?.chat?.id?.toString();
-      if (chatId !== CONFIG.telegramChatId) continue;
-      if (text === 'DATES') return 'DATES';
-      if (text === 'STATUS') return 'STATUS';
-      if (text === 'BOOK' && foundDates.length > 0) return 'BOOK';
-    }
-  } catch (e) {}
-  return null;
-}
-
+// ── Главная функция ───────────────────────────────────────────────────────────
 async function run() {
-  console.log(`[${new Date().toISOString()}] Checking for dates earlier than ${CONFIG.currentDate}...`);
+  console.log(`[${new Date().toISOString()}] Запуск...`);
 
-  await getCsrfToken();
+  await loadState();
+
   const loggedIn = await login();
-  if (!loggedIn) { console.log('[ERR] Login failed'); return; }
+  if (!loggedIn) {
+    console.log('[ERR] Не удалось войти');
+    await sendTelegram('⚠️ Бот не смог войти в систему. Возможно, изменился пароль или сессия заблокирована.');
+    await saveState();
+    return;
+  }
 
-  if (CONFIG.scheduleIds.length === 0) await getScheduleIds();
-  if (CONFIG.scheduleIds.length === 0) { console.log('[ERR] No schedule IDs found'); return; }
+  if (!state.scheduleIds || state.scheduleIds.length === 0) {
+    const found = await getScheduleIds();
+    if (!found) {
+      console.log('[ERR] Не найдены Schedule ID');
+      await saveState();
+      return;
+    }
+  }
 
-  // Проверяем команды Telegram в первую очередь
+  // Обновляем текущую дату записи с сайта
+  const appt = await getCurrentAppointment();
+  if (appt) {
+    const iso = toISODate(appt.date);
+    if (iso && iso !== state.currentDate) {
+      console.log(`[INFO] Дата записи изменилась: ${state.currentDate} → ${iso}`);
+      state.currentDate = iso;
+    }
+  }
+
+  // Читаем команды из Telegram (с учётом offset)
   const command = await checkTelegramCommands();
+  if (command) console.log('[CMD]', command);
+
+  // ── Обработка команд ────────────────────────────────────────────────────────
+  if (command === 'HELP') {
+    await sendTelegram(
+      `🤖 <b>Visa Monitor — Посольство США, Ташкент</b>\n\n` +
+      `<b>Команды:</b>\n` +
+      `📋 <b>STATUS</b> — текущая запись\n` +
+      `📅 <b>DATES</b> — все доступные даты\n` +
+      `🔖 <b>BOOK</b> — начать бронирование ранней даты\n` +
+      `✅ <b>BOOK_YES</b> — подтвердить и забронировать\n` +
+      `❌ <b>CANCEL</b> — отменить ожидающее бронирование\n\n` +
+      `⏱ Проверка каждые 5 минут.\n` +
+      `Уведомление придёт, когда найдётся дата раньше <b>${state.currentDate}</b>.`
+    );
+    await saveState();
+    return;
+  }
 
   if (command === 'STATUS') {
-    const appt = await getCurrentAppointment();
     await sendTelegram(
       `📋 <b>Текущая запись в посольство США</b>\n\n` +
-      `📅 Дата: <b>${appt?.date || CONFIG.currentDate}</b>\n` +
-      `🕐 Время: <b>${appt?.time || 'уточни на сайте'}</b>\n` +
+      `📅 Дата: <b>${appt?.date || state.currentDate}</b>\n` +
+      `🕐 Время: <b>${appt?.time || '—'}</b>\n` +
       `👫 Заявители: муж и жена\n` +
       `🏢 Посольство: Ташкент\n\n` +
-      `🔍 Бот ищет даты раньше ${CONFIG.currentDate}`
+      `🔍 Ищу даты раньше <b>${state.currentDate}</b>\n` +
+      (state.pendingBook ? `⏳ Режим автобронирования активен (CANCEL для отмены)` : '')
     );
+    await saveState();
+    return;
+  }
+
+  if (command === 'CANCEL') {
+    state.pendingBook = false;
+    await sendTelegram('❌ Автобронирование отменено. Продолжаю мониторинг.');
+    await saveState();
     return;
   }
 
   if (command === 'DATES') {
-    const dates = await checkDates();
+    const dates = await checkAllDates();
     if (!dates || dates.length === 0) {
-      await sendTelegram(`📅 <b>Доступные даты на сайте</b>\n\n❌ Сейчас нет свободных дат`);
+      await sendTelegram(`📅 <b>Доступные даты</b>\n\n❌ Свободных дат пока нет`);
     } else {
       const list = dates.slice(0, 20).map(d => {
-        const isEarlier = d.date < CONFIG.currentDate;
-        return `${isEarlier ? '✅' : '📌'} ${d.date}`;
+        const earlier = d.date < state.currentDate;
+        return `${earlier ? '✅' : '📌'} ${d.date}`;
       }).join('\n');
-      const total = dates.length;
       await sendTelegram(
-        `📅 <b>Все доступные даты на сайте (${total} шт.):</b>\n\n${list}` +
-        (total > 20 ? `\n\n...и ещё ${total - 20} дат` : '') +
-        `\n\n✅ — раньше твоей записи (${CONFIG.currentDate})\n📌 — позже твоей записи`
+        `📅 <b>Все доступные даты (${dates.length} шт.):</b>\n\n${list}` +
+        (dates.length > 20 ? `\n...и ещё ${dates.length - 20}` : '') +
+        `\n\n✅ раньше твоей (${state.currentDate})\n📌 позже твоей`
       );
     }
+    await saveState();
     return;
   }
 
-  const dates = await checkDates();
-  if (!dates) return;
+  if (command === 'BOOK') {
+    const dates = await checkAllDates();
+    const earlier = (dates || []).filter(d => d.date < state.currentDate);
+    if (earlier.length === 0) {
+      state.pendingBook = true;
+      await sendTelegram(
+        `🔖 <b>Автобронирование включено.</b>\n\n` +
+        `Сейчас нет дат раньше ${state.currentDate}.\n` +
+        `Как только появятся — автоматически забронирую без лишних вопросов.\n\n` +
+        `Отправь <b>CANCEL</b> для отмены.`
+      );
+    } else {
+      const list = earlier.slice(0, 5).map(d => `• ${d.date}`).join('\n');
+      state.pendingBook = true;
+      await sendTelegram(
+        `🔖 Найдены ранние даты:\n${list}\n\n` +
+        `Отправь <b>BOOK_YES</b> чтобы забронировать <b>${earlier[0].date}</b>\n` +
+        `или <b>CANCEL</b> для отмены.`
+      );
+    }
+    await saveState();
+    return;
+  }
 
-  // Ищем любую дату раньше текущей записи
-  const earlierDates = dates.filter(d => d.date && d.date < CONFIG.currentDate);
+  if (command === 'BOOK_YES') {
+    const dates = await checkAllDates();
+    const earlier = (dates || []).filter(d => d.date < state.currentDate).sort((a, b) => a.date.localeCompare(b.date));
+    if (earlier.length === 0) {
+      state.pendingBook = true;
+      await sendTelegram(
+        `📭 Сейчас нет дат раньше ${state.currentDate}.\n` +
+        `Автобронирование включено — сработает как только появятся.`
+      );
+    } else {
+      await sendTelegram(`⏳ Бронирую <b>${earlier[0].date}</b>...`);
+      await attemptBooking(earlier[0].date);
+    }
+    await saveState();
+    return;
+  }
 
-  if (earlierDates.length > 0) {
-    foundDates = earlierDates.map(d => d.date);
-    const list = foundDates.map(d => `• ${d}`).join('\n');
+  // ── Плановый мониторинг ─────────────────────────────────────────────────────
+  console.log(`[INFO] Ищу даты раньше ${state.currentDate}...`);
+  const dates = await checkAllDates();
+  if (dates === null) { await saveState(); return; }
 
-    const msg = `🗓 <b>Найдены более ранние даты!</b>\n\nДоступные даты:\n${list}\n\n` +
-      `Твоя текущая дата: ${CONFIG.currentDate}\n\n` +
-      `Чтобы <b>автоматически забронировать</b> первую доступную дату,\n` +
-      `напиши боту: <b>BOOK</b>`;
+  const earlier = dates
+    .filter(d => d.date && d.date < state.currentDate)
+    .sort((a, b) => a.date.localeCompare(b.date));
 
-    await sendTelegram(msg);
-    console.log('[FOUND] Earlier dates:', foundDates);
+  if (earlier.length > 0) {
+    const foundList = earlier.map(d => d.date);
+    const lastList = [...(state.lastNotifiedDates || [])].sort();
 
-    if (command === 'BOOK') {
-      const targetDate = foundDates[0];
-      console.log('[BOOKING] Бронирую:', targetDate);
-      await sendTelegram(`⏳ Бронирую дату ${targetDate}...`);
+    // Уведомляем только если даты изменились (защита от спама)
+    const isNew = JSON.stringify(foundList.slice().sort()) !== JSON.stringify(lastList);
+    if (isNew) {
+      state.lastNotifiedDates = foundList;
+      const list = foundList.slice(0, 10).map(d => `• ${d}`).join('\n');
+      await sendTelegram(
+        `🗓 <b>Найдены более ранние даты!</b>\n\nДоступные даты:\n${list}` +
+        (foundList.length > 10 ? `\n...и ещё ${foundList.length - 10}` : '') +
+        `\n\nТвоя текущая запись: <b>${state.currentDate}</b>\n\n` +
+        (state.pendingBook
+          ? `⏳ Автоматически бронирую <b>${foundList[0]}</b>...`
+          : `Отправь <b>BOOK</b> чтобы включить автобронирование`)
+      );
+      console.log('[FOUND] Ранние даты:', foundList);
+    } else {
+      console.log('[INFO] Те же даты что и прошлый раз, уведомление не нужно');
+    }
 
-      const times = await getTimeSlots(targetDate);
-      if (times.length === 0) {
-        await sendTelegram('❌ Нет доступного времени для этой даты. Попробую завтра.');
-        return;
-      }
-
-      const selectedTime = times[0];
-      const results = await bookBothAppointments(targetDate, selectedTime);
-
-      const allOk = results.every(r => r.ok);
-      const successCount = results.filter(r => r.ok).length;
-
-      if (allOk) {
-        await sendTelegram(
-          `✅ <b>Запись успешно перенесена для обоих!</b>\n\n` +
-          `📅 Новая дата: ${targetDate}\n` +
-          `🕐 Время: ${selectedTime}\n` +
-          `👫 Записаны: муж и жена\n\n` +
-          `Проверь подтверждение на сайте:\nhttps://ais.usvisa-info.com/en-uz/niv`
-        );
-        console.log('[SUCCESS] Both booked:', targetDate, selectedTime);
-      } else if (successCount > 0) {
-        await sendTelegram(
-          `⚠️ <b>Частичная запись!</b>\n\n` +
-          `📅 Дата: ${targetDate} | 🕐 Время: ${selectedTime}\n` +
-          `Записано ${successCount} из ${results.length}.\n\n` +
-          `❗ Зайди на сайт и проверь вручную!`
-        );
-      } else {
-        await sendTelegram('❌ Ошибка бронирования. Зайди на сайт вручную!');
-      }
+    // Если автобронирование включено — бронируем
+    if (state.pendingBook) {
+      await attemptBooking(foundList[0]);
     }
   } else {
-    console.log('[INFO] No earlier dates available. Current:', CONFIG.currentDate);
+    // Даты пропали — сбрасываем кэш уведомлений
+    if ((state.lastNotifiedDates || []).length > 0) {
+      state.lastNotifiedDates = [];
+      console.log('[INFO] Ранние даты исчезли, кэш сброшен');
+    }
+    console.log('[INFO] Нет дат раньше', state.currentDate);
   }
+
+  await saveState();
 }
 
-run();
+run().catch(async e => {
+  console.error('[FATAL]', e.message);
+  process.exit(1);
+});
