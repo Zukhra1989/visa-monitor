@@ -43,6 +43,7 @@ let state = {
   lastNotifiedDates: [],
   pendingBook: false,
   cookies: '',
+  preferredTime: '',   // желаемое время записи, напр. "10:00"
 };
 
 function loadState() {
@@ -107,11 +108,12 @@ async function checkTelegramCommands() {
       if (chatId !== CONFIG.telegramChatId) continue;
 
       if (text === '/START' || text === 'START' || text === '/HELP' || text === 'HELP') return 'HELP';
-      if (text === 'STATUS')   return 'STATUS';
-      if (text === 'DATES')    return 'DATES';
-      if (text === 'BOOK')     return 'BOOK';
-      if (text === 'BOOK_YES') return 'BOOK_YES';
-      if (text === 'CANCEL')   return 'CANCEL';
+      if (text === 'STATUS')              return 'STATUS';
+      if (text === 'DATES')               return 'DATES';
+      if (text === 'BOOK')                return 'BOOK';
+      if (text === 'BOOK_YES')            return 'BOOK_YES';
+      if (text === 'CANCEL')              return 'CANCEL';
+      if (text.startsWith('SETTIME '))    return text; // SETTIME HH:MM
     }
   } catch (e) {
     console.log('[TG] Ошибка getUpdates:', e.message);
@@ -348,16 +350,33 @@ async function bookAll(date, time) {
   return results;
 }
 
+// Выбирает время ближайшее к желаемому, иначе первое доступное
+function pickBestTime(times) {
+  if (!state.preferredTime || times.length === 0) return times[0];
+  const toMinutes = t => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + m;
+  };
+  const preferred = toMinutes(state.preferredTime);
+  return times.reduce((best, t) =>
+    Math.abs(toMinutes(t) - preferred) < Math.abs(toMinutes(best) - preferred) ? t : best
+  );
+}
+
 async function attemptBooking(targetDate) {
   const firstId = (state.scheduleIds || [])[0];
   const times = await getTimeSlots(firstId, targetDate);
   if (times.length === 0) {
     await sendTelegram('❌ Нет доступного времени для этой даты. Повторю при следующей проверке.');
-    state.pendingBook = true; // оставляем флаг — попробуем снова
+    state.pendingBook = true;
     return;
   }
 
-  const results = await bookAll(targetDate, times[0]);
+  const selectedTime = pickBestTime(times);
+  const wasPreferred = state.preferredTime && selectedTime === state.preferredTime;
+  console.log(`[BOOKING] Выбрано время: ${selectedTime}${state.preferredTime ? ` (желаемое: ${state.preferredTime})` : ''}`);
+
+  const results = await bookAll(targetDate, selectedTime);
   const successCount = results.filter(r => r.ok).length;
   const total = results.length;
 
@@ -367,22 +386,22 @@ async function attemptBooking(targetDate) {
     await sendTelegram(
       `✅ <b>Запись успешно перенесена!</b>\n\n` +
       `📅 Новая дата: <b>${targetDate}</b>\n` +
-      `🕐 Время: <b>${times[0]}</b>\n` +
+      `🕐 Время: <b>${selectedTime}</b>${state.preferredTime && !wasPreferred ? ` (ближайшее к ${state.preferredTime})` : ''}\n` +
       `👫 Записаны: муж и жена\n\n` +
       `🔗 Проверь: https://ais.usvisa-info.com/en-uz/niv`
     );
-    console.log('[SUCCESS] Забронировано:', targetDate, times[0]);
+    console.log('[SUCCESS] Забронировано:', targetDate, selectedTime);
   } else if (successCount > 0) {
     state.pendingBook = false;
     await sendTelegram(
       `⚠️ <b>Частичная запись!</b>\n\n` +
-      `📅 ${targetDate} 🕐 ${times[0]}\n` +
+      `📅 ${targetDate} 🕐 ${selectedTime}\n` +
       `Записано ${successCount} из ${total}.\n\n` +
       `❗ Зайди на сайт и проверь вручную!\n` +
       `🔗 https://ais.usvisa-info.com/en-uz/niv`
     );
   } else {
-    state.pendingBook = true; // повторим при следующем запуске
+    state.pendingBook = true;
     await sendTelegram(`❌ Ошибка бронирования ${targetDate}. Повторю при следующей проверке.`);
   }
 }
@@ -445,10 +464,28 @@ async function run() {
       `📅 <b>DATES</b> — все доступные даты\n` +
       `🔖 <b>BOOK</b> — начать бронирование ранней даты\n` +
       `✅ <b>BOOK_YES</b> — подтвердить и забронировать\n` +
-      `❌ <b>CANCEL</b> — отменить ожидающее бронирование\n\n` +
+      `❌ <b>CANCEL</b> — отменить ожидающее бронирование\n` +
+      `🕐 <b>SETTIME 10:00</b> — задать желаемое время записи\n\n` +
       `⏱ Проверка каждые 5 минут.\n` +
-      `Уведомление придёт, когда найдётся дата раньше <b>${state.currentDate}</b>.`
+      `Уведомление придёт, когда найдётся дата раньше <b>${state.currentDate}</b>.\n` +
+      (state.preferredTime ? `🕐 Желаемое время: <b>${state.preferredTime}</b>` : `🕐 Желаемое время не задано — берётся первый слот`)
     );
+    saveState();
+    return;
+  }
+
+  if (command && command.startsWith('SETTIME ')) {
+    const time = command.replace('SETTIME ', '').trim();
+    if (/^\d{2}:\d{2}$/.test(time)) {
+      state.preferredTime = time;
+      await sendTelegram(
+        `🕐 Желаемое время установлено: <b>${time}</b>\n\n` +
+        `При бронировании бот выберет слот ближайший к этому времени.\n` +
+        `Чтобы убрать — отправь <b>SETTIME 00:00</b>`
+      );
+    } else {
+      await sendTelegram(`❌ Неверный формат. Используй: <b>SETTIME 10:00</b>`);
+    }
     saveState();
     return;
   }
@@ -461,6 +498,7 @@ async function run() {
       `👫 Заявители: муж и жена\n` +
       `🏢 Посольство: Ташкент\n\n` +
       `🔍 Ищу даты раньше <b>${state.currentDate}</b>\n` +
+      `🕐 Желаемое время: <b>${state.preferredTime || 'не задано (первый слот)'}</b>\n` +
       (state.pendingBook ? `⏳ Режим автобронирования активен (CANCEL для отмены)` : '')
     );
     saveState();
